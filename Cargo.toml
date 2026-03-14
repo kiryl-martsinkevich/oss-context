@@ -22,5 +22,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 dirs = "6"
+shellexpand = "3"
 anyhow = "1"
 thiserror = "2"
