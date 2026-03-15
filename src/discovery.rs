@@ -316,8 +316,8 @@ fn extract_quoted_after(content: &str, keyword: &str) -> Vec<String> {
             let after = &trimmed[pos + keyword.len()..];
             let after = after.trim_start();
             // Skip '=' if present
-            let after = if after.starts_with('=') {
-                after[1..].trim_start()
+            let after = if let Some(rest) = after.strip_prefix('=') {
+                rest.trim_start()
             } else {
                 after
             };

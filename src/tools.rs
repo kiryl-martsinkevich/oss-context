@@ -230,10 +230,7 @@ impl OssContextServer {
                     e
                 ))])),
             }
-        } else if path
-            .chars()
-            .last()
-            .map_or(true, |c| c.is_lowercase() || c == '.')
+        } else if path.ends_with('.') || path.chars().last().is_some_and(|c| c.is_lowercase())
         {
             match store.list_types_in_package(path) {
                 Ok(types) if types.is_empty() => {
