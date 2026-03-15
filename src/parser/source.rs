@@ -340,11 +340,27 @@ fn extract_annotations(node: tree_sitter::Node, source: &str) -> Option<Vec<Stri
 }
 
 fn has_modifier(node: tree_sitter::Node, source: &str, modifier: &str) -> bool {
+    // Check for modifiers as a field
     if let Some(modifiers) = node.child_by_field_name("modifiers") {
         let mut cursor = modifiers.walk();
         for child in modifiers.children(&mut cursor) {
             if node_text(child, source) == modifier {
                 return true;
+            }
+        }
+    }
+    // Also check direct children for modifier keywords (some tree-sitter-java versions)
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == modifier {
+            return true;
+        }
+        if child.kind() == "modifiers" {
+            let mut mc = child.walk();
+            for gc in child.children(&mut mc) {
+                if node_text(gc, source) == modifier || gc.kind() == modifier {
+                    return true;
+                }
             }
         }
     }
@@ -443,6 +459,9 @@ public class Foo extends Bar implements Baz {
 
         let methods = store.get_methods_for_type(types[0].id).unwrap();
         assert_eq!(methods.len(), 2);
+
+        let count_method = methods.iter().find(|m| m.name == "count").unwrap();
+        assert!(count_method.is_static, "count() should be static, sig={}", count_method.signature);
 
         let fields = store.get_fields_for_type(types[0].id).unwrap();
         assert_eq!(fields.len(), 1);
