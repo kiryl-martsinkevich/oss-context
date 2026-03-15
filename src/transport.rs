@@ -9,9 +9,33 @@ pub async fn serve_stdio(server: OssContextServer) -> Result<()> {
     Ok(())
 }
 
-pub async fn serve_sse(_server: OssContextServer, port: u16) -> Result<()> {
-    tracing::info!("Starting MCP server on SSE port {}", port);
-    // SSE/HTTP transport requires additional setup with axum
-    // For now, this is a placeholder — stdio is the primary transport
-    todo!("SSE transport - requires axum integration with rmcp's server-side-http feature")
+pub async fn serve_sse(server: OssContextServer, port: u16) -> Result<()> {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+    use std::sync::Arc;
+
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig {
+        stateful_mode: true,
+        cancellation_token: ct.clone(),
+        ..Default::default()
+    };
+
+    let service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default()),
+        config,
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    tracing::info!("MCP server listening on http://{}/mcp", addr);
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move { ct.cancelled_owned().await })
+        .await?;
+
+    Ok(())
 }

@@ -81,9 +81,7 @@ Or in Claude Desktop's `claude_desktop_config.json`:
 }
 ```
 
-This is useful for shared/remote setups where multiple clients connect to one server instance.
-
-> **Note:** SSE transport is not yet implemented — this is the planned interface. Use stdio for now.
+This is useful for shared/remote setups where multiple clients connect to one server instance. The server uses MCP's Streamable HTTP transport at the `/mcp` endpoint.
 
 ## Configuration
 
