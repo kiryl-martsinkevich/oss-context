@@ -55,6 +55,36 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
+### SSE mode
+
+Start the server:
+
+```bash
+./target/release/oss-context --transport sse --port 8080
+```
+
+Then connect from Claude Code:
+
+```bash
+claude mcp add --transport sse oss-context http://localhost:8080/sse
+```
+
+Or in Claude Desktop's `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "oss-context": {
+      "url": "http://localhost:8080/sse"
+    }
+  }
+}
+```
+
+This is useful for shared/remote setups where multiple clients connect to one server instance.
+
+> **Note:** SSE transport is not yet implemented — this is the planned interface. Use stdio for now.
+
 ## Configuration
 
 The server auto-discovers repos at startup. Override with a config file or CLI flags.
