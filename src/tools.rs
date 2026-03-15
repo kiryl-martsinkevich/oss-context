@@ -96,24 +96,34 @@ impl OssContextServer {
             }
         };
 
-        // Check if already indexed
-        if let Some(store) = self.open_store(&lib) {
-            if store.has_library_meta().unwrap_or(false) {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Library {} is ready. Use this ID with query_docs and browse_library: {}",
-                    lib.to_string_id(),
-                    lib.to_string_id()
-                ))]));
+        // Run blocking I/O on a dedicated thread
+        let server = self.clone();
+        let lib_clone = lib.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            // Check if already indexed
+            if let Some(store) = server.open_store(&lib_clone) {
+                if store.has_library_meta().unwrap_or(false) {
+                    return Ok(format!(
+                        "Library {} is ready. Use this ID with query_docs and browse_library: {}",
+                        lib_clone.to_string_id(),
+                        lib_clone.to_string_id()
+                    ));
+                }
             }
-        }
 
-        // Resolve and index
-        match self.resolve_and_index(&lib) {
-            Ok(_) => Ok(CallToolResult::success(vec![Content::text(format!(
+            // Resolve and index
+            server.resolve_and_index(&lib_clone)?;
+            Ok(format!(
                 "Library {} indexed successfully. Use this ID with query_docs and browse_library: {}",
-                lib.to_string_id(),
-                lib.to_string_id()
-            ))])),
+                lib_clone.to_string_id(),
+                lib_clone.to_string_id()
+            ))
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Task join error: {}", e), None))?;
+
+        match result {
+            Ok(msg) => Ok(CallToolResult::success(vec![Content::text(msg)])),
             Err(e) => {
                 error!("Failed to resolve {}: {}", lib.to_string_id(), e);
                 Ok(CallToolResult::error(vec![Content::text(format!(
@@ -139,51 +149,56 @@ impl OssContextServer {
             }
         };
 
-        let store = match self.open_store(&lib) {
-            Some(store) => store,
-            None => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Library {} is not indexed. Call resolve_library first.",
-                    params.0.library_id
-                ))]));
-            }
-        };
-
+        let server = self.clone();
+        let query = params.0.query.clone();
+        let library_id = params.0.library_id.clone();
         let limit = params.0.limit.unwrap_or(20);
-        match store.search(&params.0.query, limit) {
-            Ok(results) if results.is_empty() => Ok(CallToolResult::success(vec![Content::text(
-                format!(
-                    "No results found for '{}' in {}",
-                    params.0.query, params.0.library_id
-                ),
-            )])),
-            Ok(results) => {
-                let mut output = format!(
-                    "Found {} results for '{}' in {}:\n\n",
-                    results.len(),
-                    params.0.query,
-                    params.0.library_id
-                );
-                for (i, r) in results.iter().enumerate() {
-                    output.push_str(&format!("{}. [{}] {}\n", i + 1, r.kind, r.fqn));
-                    if let Some(ref sig) = r.signature {
-                        if !sig.is_empty() {
-                            output.push_str(&format!("   Signature: {}\n", sig));
-                        }
-                    }
-                    if let Some(ref doc) = r.doc_comment {
-                        let truncated: String = doc.chars().take(200).collect();
-                        output.push_str(&format!("   {}\n", truncated));
-                    }
-                    output.push('\n');
+
+        tokio::task::spawn_blocking(move || {
+            let store = match server.open_store(&lib) {
+                Some(store) => store,
+                None => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Library {} is not indexed. Call resolve_library first.",
+                        library_id
+                    ))]));
                 }
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+            };
+
+            match store.search(&query, limit) {
+                Ok(results) if results.is_empty() => Ok(CallToolResult::success(vec![
+                    Content::text(format!("No results found for '{}' in {}", query, library_id)),
+                ])),
+                Ok(results) => {
+                    let mut output = format!(
+                        "Found {} results for '{}' in {}:\n\n",
+                        results.len(),
+                        query,
+                        library_id
+                    );
+                    for (i, r) in results.iter().enumerate() {
+                        output.push_str(&format!("{}. [{}] {}\n", i + 1, r.kind, r.fqn));
+                        if let Some(ref sig) = r.signature {
+                            if !sig.is_empty() {
+                                output.push_str(&format!("   Signature: {}\n", sig));
+                            }
+                        }
+                        if let Some(ref doc) = r.doc_comment {
+                            let truncated: String = doc.chars().take(200).collect();
+                            output.push_str(&format!("   {}\n", truncated));
+                        }
+                        output.push('\n');
+                    }
+                    Ok(CallToolResult::success(vec![Content::text(output)]))
+                }
+                Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Search error: {}",
+                    e
+                ))])),
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Search error: {}",
-                e
-            ))])),
-        }
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Task join error: {}", e), None))?
     }
 
     #[tool(description = "Browse a Java library's documentation hierarchically. Without a path: list packages. With a package name: list classes. With a fully qualified class name: show full documentation including all methods and fields.")]
@@ -200,69 +215,76 @@ impl OssContextServer {
             }
         };
 
-        let store = match self.open_store(&lib) {
-            Some(store) => store,
-            None => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Library {} is not indexed. Call resolve_library first.",
-                    params.0.library_id
-                ))]));
-            }
-        };
+        let server = self.clone();
+        let library_id = params.0.library_id.clone();
+        let path = params.0.path.clone().unwrap_or_default();
 
-        let path = params.0.path.as_deref().unwrap_or("");
+        tokio::task::spawn_blocking(move || {
+            let store = match server.open_store(&lib) {
+                Some(store) => store,
+                None => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Library {} is not indexed. Call resolve_library first.",
+                        library_id
+                    ))]));
+                }
+            };
 
-        if path.is_empty() {
-            match store.list_packages() {
-                Ok(packages) => {
-                    let mut output = format!("Packages in {}:\n\n", params.0.library_id);
-                    for p in &packages {
-                        output.push_str(&format!("  {}\n", p.name));
-                        if let Some(ref doc) = p.doc_comment {
-                            let short: String = doc.chars().take(100).collect();
-                            output.push_str(&format!("    {}\n", short));
+            if path.is_empty() {
+                match store.list_packages() {
+                    Ok(packages) => {
+                        let mut output = format!("Packages in {}:\n\n", library_id);
+                        for p in &packages {
+                            output.push_str(&format!("  {}\n", p.name));
+                            if let Some(ref doc) = p.doc_comment {
+                                let short: String = doc.chars().take(100).collect();
+                                output.push_str(&format!("    {}\n", short));
+                            }
                         }
+                        Ok(CallToolResult::success(vec![Content::text(output)]))
                     }
-                    Ok(CallToolResult::success(vec![Content::text(output)]))
+                    Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Error: {}",
+                        e
+                    ))])),
                 }
-                Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error: {}",
-                    e
-                ))])),
-            }
-        } else if path.ends_with('.') || path.chars().last().is_some_and(|c| c.is_lowercase())
-        {
-            match store.list_types_in_package(path) {
-                Ok(types) if types.is_empty() => {
-                    Ok(browse_type_detail(&store, path, &params.0.library_id))
-                }
-                Ok(types) => {
-                    let mut output = format!("Types in {}:\n\n", path);
-                    for t in &types {
-                        output.push_str(&format!(
-                            "  {} {} {}\n",
-                            t.kind,
-                            t.fqn,
-                            t.superclass
-                                .as_deref()
-                                .map(|s| format!("extends {}", s))
-                                .unwrap_or_default()
-                        ));
-                        if let Some(ref doc) = t.doc_comment {
-                            let short: String = doc.chars().take(100).collect();
-                            output.push_str(&format!("    {}\n", short));
+            } else if path.ends_with('.')
+                || path.chars().last().is_some_and(|c| c.is_lowercase())
+            {
+                match store.list_types_in_package(&path) {
+                    Ok(types) if types.is_empty() => {
+                        Ok(browse_type_detail(&store, &path, &library_id))
+                    }
+                    Ok(types) => {
+                        let mut output = format!("Types in {}:\n\n", path);
+                        for t in &types {
+                            output.push_str(&format!(
+                                "  {} {} {}\n",
+                                t.kind,
+                                t.fqn,
+                                t.superclass
+                                    .as_deref()
+                                    .map(|s| format!("extends {}", s))
+                                    .unwrap_or_default()
+                            ));
+                            if let Some(ref doc) = t.doc_comment {
+                                let short: String = doc.chars().take(100).collect();
+                                output.push_str(&format!("    {}\n", short));
+                            }
                         }
+                        Ok(CallToolResult::success(vec![Content::text(output)]))
                     }
-                    Ok(CallToolResult::success(vec![Content::text(output)]))
+                    Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Error: {}",
+                        e
+                    ))])),
                 }
-                Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error: {}",
-                    e
-                ))])),
+            } else {
+                Ok(browse_type_detail(&store, &path, &library_id))
             }
-        } else {
-            Ok(browse_type_detail(&store, path, &params.0.library_id))
-        }
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Task join error: {}", e), None))?
     }
 }
 
