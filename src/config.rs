@@ -160,8 +160,20 @@ impl AppConfig {
             .join("config.toml");
 
         if path.exists() {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
-            toml::from_str(&content).unwrap_or_default()
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Failed to read config file {}: {}", path.display(), e);
+                    return FileConfig::default();
+                }
+            };
+            match toml::from_str(&content) {
+                Ok(config) => config,
+                Err(e) => {
+                    tracing::warn!("Failed to parse config file {}: {}", path.display(), e);
+                    FileConfig::default()
+                }
+            }
         } else {
             FileConfig::default()
         }

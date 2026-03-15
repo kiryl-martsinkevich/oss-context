@@ -5,7 +5,6 @@ use std::path::Path;
 use tracing::warn;
 
 pub fn parse_javadoc_dir(dir: &Path, store: &Store) -> Result<()> {
-    // Parse package-summary pages first
     walk_html_files(dir, &mut |path| {
         let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
         if filename == "package-summary.html" {
@@ -13,34 +12,23 @@ pub fn parse_javadoc_dir(dir: &Path, store: &Store) -> Result<()> {
             if let Err(e) = parse_package_summary(&content, dir, path, store) {
                 warn!("Failed to parse package summary {}: {}", path.display(), e);
             }
-        }
-        Ok(())
-    })?;
-
-    // Parse class pages
-    walk_html_files(dir, &mut |path| {
-        let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-        if filename.starts_with("package-")
-            || filename.starts_with("index")
-            || filename.starts_with("allclasses")
-            || filename.starts_with("allpackages")
-            || filename.starts_with("overview")
-            || filename == "help-doc.html"
-            || filename == "deprecated-list.html"
-            || filename == "serialized-form.html"
-            || filename == "constant-values.html"
+        } else if !filename.starts_with("package-")
+            && !filename.starts_with("index")
+            && !filename.starts_with("allclasses")
+            && !filename.starts_with("allpackages")
+            && !filename.starts_with("overview")
+            && filename != "help-doc.html"
+            && filename != "deprecated-list.html"
+            && filename != "serialized-form.html"
+            && filename != "constant-values.html"
         {
-            return Ok(());
-        }
-
-        let content = std::fs::read_to_string(path)?;
-        if let Err(e) = parse_class_page(&content, dir, path, store) {
-            warn!("Failed to parse javadoc page {}: {}", path.display(), e);
+            let content = std::fs::read_to_string(path)?;
+            if let Err(e) = parse_class_page(&content, dir, path, store) {
+                warn!("Failed to parse javadoc page {}: {}", path.display(), e);
+            }
         }
         Ok(())
-    })?;
-
-    Ok(())
+    })
 }
 
 fn walk_html_files(dir: &Path, handler: &mut dyn FnMut(&Path) -> Result<()>) -> Result<()> {
@@ -135,7 +123,7 @@ fn parse_class_page(html: &str, base_dir: &Path, path: &Path, store: &Store) -> 
         id: 0,
         package_id: pkg_id,
         name: class_name,
-        fqn,
+        fqn: fqn.clone(),
         kind: kind.to_string(),
         doc_comment,
         annotations: None,
@@ -144,8 +132,8 @@ fn parse_class_page(html: &str, base_dir: &Path, path: &Path, store: &Store) -> 
     };
     let type_id = store.insert_type(&type_row)?;
 
-    parse_method_details(&doc, type_id, store)?;
-    parse_field_details(&doc, type_id, store)?;
+    parse_method_details(&doc, type_id, &fqn, store)?;
+    parse_field_details(&doc, type_id, &fqn, store)?;
 
     Ok(())
 }
@@ -176,7 +164,7 @@ fn parse_type_heading(heading: &str) -> (&str, String) {
     ("class", name)
 }
 
-fn parse_method_details(doc: &Html, type_id: i64, store: &Store) -> Result<()> {
+fn parse_method_details(doc: &Html, type_id: i64, parent_fqn: &str, store: &Store) -> Result<()> {
     let detail_sel = Selector::parse(
         ".method-details .member-list > li, \
          section.method-details ul.member-list > li, \
@@ -227,7 +215,7 @@ fn parse_method_details(doc: &Html, type_id: i64, store: &Store) -> Result<()> {
                 annotations: None,
                 is_static: signature.contains("static "),
             };
-            store.insert_method(&method_row)?;
+            store.insert_method(&method_row, parent_fqn)?;
         }
         break;
     }
@@ -235,7 +223,7 @@ fn parse_method_details(doc: &Html, type_id: i64, store: &Store) -> Result<()> {
     Ok(())
 }
 
-fn parse_field_details(doc: &Html, type_id: i64, store: &Store) -> Result<()> {
+fn parse_field_details(doc: &Html, type_id: i64, parent_fqn: &str, store: &Store) -> Result<()> {
     let detail_sel = Selector::parse(
         ".field-details .member-list > li, \
          section.field-details ul.member-list > li",
@@ -273,7 +261,7 @@ fn parse_field_details(doc: &Html, type_id: i64, store: &Store) -> Result<()> {
             annotations: None,
             is_static: signature.contains("static "),
         };
-        store.insert_field(&field_row)?;
+        store.insert_field(&field_row, parent_fqn)?;
     }
 
     Ok(())

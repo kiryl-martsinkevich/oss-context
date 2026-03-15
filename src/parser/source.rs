@@ -160,10 +160,10 @@ fn parse_type_declaration(
         for child in body.children(&mut cursor) {
             match child.kind() {
                 "method_declaration" | "constructor_declaration" => {
-                    parse_method(child, source, type_id, store)?;
+                    parse_method(child, source, type_id, &fqn, store)?;
                 }
                 "field_declaration" => {
-                    parse_field(child, source, type_id, store)?;
+                    parse_field(child, source, type_id, &fqn, store)?;
                 }
                 _ => {}
             }
@@ -177,6 +177,7 @@ fn parse_method(
     node: tree_sitter::Node,
     source: &str,
     type_id: i64,
+    parent_fqn: &str,
     store: &Store,
 ) -> Result<()> {
     let name = node
@@ -212,7 +213,7 @@ fn parse_method(
         annotations: annotations.map(|a| serde_json::to_string(&a).unwrap_or_default()),
         is_static,
     };
-    store.insert_method(&method_row)?;
+    store.insert_method(&method_row, parent_fqn)?;
     Ok(())
 }
 
@@ -220,12 +221,19 @@ fn parse_field(
     node: tree_sitter::Node,
     source: &str,
     type_id: i64,
+    parent_fqn: &str,
     store: &Store,
 ) -> Result<()> {
     let field_type = node
         .child_by_field_name("type")
         .map(|n| node_text(n, source).to_string())
         .unwrap_or_default();
+
+    // Hoist shared properties out of the declarator loop
+    let doc_comment = extract_preceding_doc_comment(node, source);
+    let annotations = extract_annotations(node, source);
+    let is_static = has_modifier(node, source, "static");
+    let annotations_json = annotations.map(|a| serde_json::to_string(&a).unwrap_or_default());
 
     // A field_declaration can have multiple declarators
     let mut cursor = node.walk();
@@ -239,20 +247,16 @@ fn parse_field(
                 continue;
             }
 
-            let doc_comment = extract_preceding_doc_comment(node, source);
-            let annotations = extract_annotations(node, source);
-            let is_static = has_modifier(node, source, "static");
-
             let field_row = FieldRow {
                 id: 0,
                 type_id,
                 name,
                 field_type: field_type.clone(),
-                doc_comment,
-                annotations: annotations.map(|a| serde_json::to_string(&a).unwrap_or_default()),
+                doc_comment: doc_comment.clone(),
+                annotations: annotations_json.clone(),
                 is_static,
             };
-            store.insert_field(&field_row)?;
+            store.insert_field(&field_row, parent_fqn)?;
         }
     }
     Ok(())

@@ -195,6 +195,24 @@ impl Store {
         Ok(id)
     }
 
+    pub fn begin_transaction(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN")?;
+        Ok(())
+    }
+
+    pub fn commit_transaction(&self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    fn insert_fts(&self, fqn: &str, kind: &str, signature: &str, doc_comment: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO docs_fts (fqn, kind, signature, doc_comment) VALUES (?1, ?2, ?3, ?4)",
+            params![fqn, kind, signature, doc_comment],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_type(&self, row: &TypeRow) -> Result<i64> {
         self.conn.execute(
             "INSERT OR REPLACE INTO type (package_id, name, fqn, kind, doc_comment, annotations, superclass, interfaces)
@@ -205,14 +223,12 @@ impl Store {
             ],
         )?;
         let id = self.conn.last_insert_rowid();
-        self.conn.execute(
-            "INSERT INTO docs_fts (fqn, kind, signature, doc_comment) VALUES (?1, ?2, ?3, ?4)",
-            params![row.fqn, row.kind, "", row.doc_comment],
-        )?;
+        self.insert_fts(&row.fqn, &row.kind, "", row.doc_comment.as_deref())?;
         Ok(id)
     }
 
-    pub fn insert_method(&self, row: &MethodRow) -> Result<i64> {
+    /// Insert a method. `parent_fqn` is the owning type's fully qualified name.
+    pub fn insert_method(&self, row: &MethodRow, parent_fqn: &str) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO method (type_id, name, signature, return_type, params, doc_comment, annotations, is_static)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -222,20 +238,13 @@ impl Store {
             ],
         )?;
         let id = self.conn.last_insert_rowid();
-        let parent_fqn: String = self.conn.query_row(
-            "SELECT fqn FROM type WHERE id = ?1",
-            params![row.type_id],
-            |r| r.get(0),
-        )?;
         let method_fqn = format!("{}.{}", parent_fqn, row.name);
-        self.conn.execute(
-            "INSERT INTO docs_fts (fqn, kind, signature, doc_comment) VALUES (?1, ?2, ?3, ?4)",
-            params![method_fqn, "method", row.signature, row.doc_comment],
-        )?;
+        self.insert_fts(&method_fqn, "method", &row.signature, row.doc_comment.as_deref())?;
         Ok(id)
     }
 
-    pub fn insert_field(&self, row: &FieldRow) -> Result<i64> {
+    /// Insert a field. `parent_fqn` is the owning type's fully qualified name.
+    pub fn insert_field(&self, row: &FieldRow, parent_fqn: &str) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO field (type_id, name, field_type, doc_comment, annotations, is_static)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -245,16 +254,8 @@ impl Store {
             ],
         )?;
         let id = self.conn.last_insert_rowid();
-        let parent_fqn: String = self.conn.query_row(
-            "SELECT fqn FROM type WHERE id = ?1",
-            params![row.type_id],
-            |r| r.get(0),
-        )?;
         let field_fqn = format!("{}.{}", parent_fqn, row.name);
-        self.conn.execute(
-            "INSERT INTO docs_fts (fqn, kind, signature, doc_comment) VALUES (?1, ?2, ?3, ?4)",
-            params![field_fqn, "field", row.field_type, row.doc_comment],
-        )?;
+        self.insert_fts(&field_fqn, "field", &row.field_type, row.doc_comment.as_deref())?;
         Ok(id)
     }
 
@@ -448,7 +449,7 @@ mod tests {
             doc_comment: Some("Does something useful".to_string()),
             annotations: None, is_static: false,
         };
-        store.insert_method(&method_row).unwrap();
+        store.insert_method(&method_row, "com.example.MyClass").unwrap();
 
         let methods = store.get_methods_for_type(type_id).unwrap();
         assert_eq!(methods.len(), 1);
