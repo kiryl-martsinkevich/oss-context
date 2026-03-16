@@ -1,13 +1,11 @@
 use crate::config::AppConfig;
+use crate::mcp::{CallToolResult, Content, ToolDef};
 use crate::parser;
 use crate::resolver;
 use crate::store::{LibraryId, Store};
-use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::Value;
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -38,14 +36,12 @@ pub struct BrowseLibraryParams {
 #[derive(Clone)]
 pub struct OssContextServer {
     config: Arc<AppConfig>,
-    tool_router: ToolRouter<Self>,
 }
 
 impl OssContextServer {
     pub fn new(config: AppConfig) -> Self {
         Self {
             config: Arc::new(config),
-            tool_router: Self::tool_router(),
         }
     }
 
@@ -74,33 +70,58 @@ impl OssContextServer {
         parser::index_jar(&jar, lib, &store).map_err(|e| format!("Failed to index: {}", e))?;
         Ok(store)
     }
-}
 
-#[tool_router(router = tool_router)]
-impl OssContextServer {
-    #[tool(description = "Resolve a Java library and make its documentation available for querying. Accepts 'groupId:artifactId:version' format. Returns the library ID to use with query_docs and browse_library.")]
-    async fn resolve_library(
-        &self,
-        params: Parameters<ResolveLibraryParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let query = params.0.query.trim().to_string();
+    pub fn tool_definitions() -> Vec<ToolDef> {
+        vec![
+            ToolDef {
+                name: "resolve_library".to_string(),
+                description: "Resolve a Java library and make its documentation available for querying. Accepts 'groupId:artifactId:version' format. Returns the library ID to use with query_docs and browse_library.".to_string(),
+                input_schema: schemars::schema_for!(ResolveLibraryParams).to_value(),
+            },
+            ToolDef {
+                name: "query_docs".to_string(),
+                description: "Search documentation across a resolved Java library using free-text queries. Returns matching classes, methods, and fields ranked by relevance.".to_string(),
+                input_schema: schemars::schema_for!(QueryDocsParams).to_value(),
+            },
+            ToolDef {
+                name: "browse_library".to_string(),
+                description: "Browse a Java library's documentation hierarchically. Without a path: list packages. With a package name: list classes. With a fully qualified class name: show full documentation including all methods and fields.".to_string(),
+                input_schema: schemars::schema_for!(BrowseLibraryParams).to_value(),
+            },
+        ]
+    }
+
+    pub async fn call_tool(&self, name: &str, args: Value) -> CallToolResult {
+        match name {
+            "resolve_library" => self.resolve_library(args).await,
+            "query_docs" => self.query_docs(args).await,
+            "browse_library" => self.browse_library(args).await,
+            _ => CallToolResult::error(vec![Content::text(format!("Unknown tool: {}", name))]),
+        }
+    }
+
+    async fn resolve_library(&self, args: Value) -> CallToolResult {
+        let params: ResolveLibraryParams = match serde_json::from_value(args) {
+            Ok(p) => p,
+            Err(e) => return CallToolResult::error(vec![Content::text(format!("Invalid parameters: {}", e))]),
+        };
+
+        let query = params.query.trim().to_string();
         info!("Resolving library: {}", query);
 
         let lib = match Self::parse_library_id(&query) {
             Some(lib) => lib,
             None => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return CallToolResult::error(vec![Content::text(format!(
                     "Could not parse library identifier '{}'. Please use groupId:artifactId:version format (e.g. 'com.google.guava:guava:33.0.0-jre')",
                     query
-                ))]));
+                ))]);
             }
         };
 
-        // Run blocking I/O on a dedicated thread
         let server = self.clone();
         let lib_clone = lib.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            // Check if already indexed
             if let Some(store) = server.open_store(&lib_clone) {
                 if store.has_library_meta().unwrap_or(false) {
                     return Ok(format!(
@@ -111,7 +132,6 @@ impl OssContextServer {
                 }
             }
 
-            // Resolve and index
             server.resolve_and_index(&lib_clone)?;
             Ok(format!(
                 "Library {} indexed successfully. Use this ID with query_docs and browse_library: {}",
@@ -119,56 +139,57 @@ impl OssContextServer {
                 lib_clone.to_string_id()
             ))
         })
-        .await
-        .map_err(|e| ErrorData::internal_error(format!("Task join error: {}", e), None))?;
+        .await;
 
         match result {
-            Ok(msg) => Ok(CallToolResult::success(vec![Content::text(msg)])),
-            Err(e) => {
+            Ok(Ok(msg)) => CallToolResult::success(vec![Content::text(msg)]),
+            Ok(Err(e)) => {
                 error!("Failed to resolve {}: {}", lib.to_string_id(), e);
-                Ok(CallToolResult::error(vec![Content::text(format!(
+                CallToolResult::error(vec![Content::text(format!(
                     "Could not find documentation for {}: {}",
                     lib.to_string_id(),
                     e
-                ))]))
+                ))])
             }
+            Err(e) => CallToolResult::error(vec![Content::text(format!("Task join error: {}", e))]),
         }
     }
 
-    #[tool(description = "Search documentation across a resolved Java library using free-text queries. Returns matching classes, methods, and fields ranked by relevance.")]
-    async fn query_docs(
-        &self,
-        params: Parameters<QueryDocsParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let lib = match Self::parse_library_id(&params.0.library_id) {
+    async fn query_docs(&self, args: Value) -> CallToolResult {
+        let params: QueryDocsParams = match serde_json::from_value(args) {
+            Ok(p) => p,
+            Err(e) => return CallToolResult::error(vec![Content::text(format!("Invalid parameters: {}", e))]),
+        };
+
+        let lib = match Self::parse_library_id(&params.library_id) {
             Some(lib) => lib,
             None => {
-                return Ok(CallToolResult::error(vec![Content::text(
+                return CallToolResult::error(vec![Content::text(
                     "Invalid library_id format. Use groupId:artifactId:version",
-                )]));
+                )]);
             }
         };
 
         let server = self.clone();
-        let query = params.0.query.clone();
-        let library_id = params.0.library_id.clone();
-        let limit = params.0.limit.unwrap_or(20);
+        let query = params.query.clone();
+        let library_id = params.library_id.clone();
+        let limit = params.limit.unwrap_or(20);
 
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let store = match server.open_store(&lib) {
                 Some(store) => store,
                 None => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                    return CallToolResult::error(vec![Content::text(format!(
                         "Library {} is not indexed. Call resolve_library first.",
                         library_id
-                    ))]));
+                    ))]);
                 }
             };
 
             match store.search(&query, limit) {
-                Ok(results) if results.is_empty() => Ok(CallToolResult::success(vec![
+                Ok(results) if results.is_empty() => CallToolResult::success(vec![
                     Content::text(format!("No results found for '{}' in {}", query, library_id)),
-                ])),
+                ]),
                 Ok(results) => {
                     let mut output = format!(
                         "Found {} results for '{}' in {}:\n\n",
@@ -189,44 +210,49 @@ impl OssContextServer {
                         }
                         output.push('\n');
                     }
-                    Ok(CallToolResult::success(vec![Content::text(output)]))
+                    CallToolResult::success(vec![Content::text(output)])
                 }
-                Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                Err(e) => CallToolResult::error(vec![Content::text(format!(
                     "Search error: {}",
                     e
-                ))])),
+                ))]),
             }
         })
-        .await
-        .map_err(|e| ErrorData::internal_error(format!("Task join error: {}", e), None))?
+        .await;
+
+        match result {
+            Ok(r) => r,
+            Err(e) => CallToolResult::error(vec![Content::text(format!("Task join error: {}", e))]),
+        }
     }
 
-    #[tool(description = "Browse a Java library's documentation hierarchically. Without a path: list packages. With a package name: list classes. With a fully qualified class name: show full documentation including all methods and fields.")]
-    async fn browse_library(
-        &self,
-        params: Parameters<BrowseLibraryParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let lib = match Self::parse_library_id(&params.0.library_id) {
+    async fn browse_library(&self, args: Value) -> CallToolResult {
+        let params: BrowseLibraryParams = match serde_json::from_value(args) {
+            Ok(p) => p,
+            Err(e) => return CallToolResult::error(vec![Content::text(format!("Invalid parameters: {}", e))]),
+        };
+
+        let lib = match Self::parse_library_id(&params.library_id) {
             Some(lib) => lib,
             None => {
-                return Ok(CallToolResult::error(vec![Content::text(
+                return CallToolResult::error(vec![Content::text(
                     "Invalid library_id format.",
-                )]));
+                )]);
             }
         };
 
         let server = self.clone();
-        let library_id = params.0.library_id.clone();
-        let path = params.0.path.clone().unwrap_or_default();
+        let library_id = params.library_id.clone();
+        let path = params.path.clone().unwrap_or_default();
 
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let store = match server.open_store(&lib) {
                 Some(store) => store,
                 None => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                    return CallToolResult::error(vec![Content::text(format!(
                         "Library {} is not indexed. Call resolve_library first.",
                         library_id
-                    ))]));
+                    ))]);
                 }
             };
 
@@ -241,19 +267,19 @@ impl OssContextServer {
                                 output.push_str(&format!("    {}\n", short));
                             }
                         }
-                        Ok(CallToolResult::success(vec![Content::text(output)]))
+                        CallToolResult::success(vec![Content::text(output)])
                     }
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                    Err(e) => CallToolResult::error(vec![Content::text(format!(
                         "Error: {}",
                         e
-                    ))])),
+                    ))]),
                 }
             } else if path.ends_with('.')
                 || path.chars().last().is_some_and(|c| c.is_lowercase())
             {
                 match store.list_types_in_package(&path) {
                     Ok(types) if types.is_empty() => {
-                        Ok(browse_type_detail(&store, &path, &library_id))
+                        browse_type_detail(&store, &path, &library_id)
                     }
                     Ok(types) => {
                         let mut output = format!("Types in {}:\n\n", path);
@@ -272,19 +298,23 @@ impl OssContextServer {
                                 output.push_str(&format!("    {}\n", short));
                             }
                         }
-                        Ok(CallToolResult::success(vec![Content::text(output)]))
+                        CallToolResult::success(vec![Content::text(output)])
                     }
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                    Err(e) => CallToolResult::error(vec![Content::text(format!(
                         "Error: {}",
                         e
-                    ))])),
+                    ))]),
                 }
             } else {
-                Ok(browse_type_detail(&store, &path, &library_id))
+                browse_type_detail(&store, &path, &library_id)
             }
         })
-        .await
-        .map_err(|e| ErrorData::internal_error(format!("Task join error: {}", e), None))?
+        .await;
+
+        match result {
+            Ok(r) => r,
+            Err(e) => CallToolResult::error(vec![Content::text(format!("Task join error: {}", e))]),
+        }
     }
 }
 
@@ -337,14 +367,5 @@ fn browse_type_detail(store: &Store, fqn: &str, library_id: &str) -> CallToolRes
             fqn, library_id
         ))]),
         Err(e) => CallToolResult::error(vec![Content::text(format!("Error: {}", e))]),
-    }
-}
-
-#[tool_handler(router = self.tool_router)]
-impl ServerHandler for OssContextServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
-            Implementation::new("oss-context", env!("CARGO_PKG_VERSION")),
-        )
     }
 }
